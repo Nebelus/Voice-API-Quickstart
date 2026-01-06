@@ -36,7 +36,7 @@ docs/
 │   ├── app.js                      # Application logic
 │   └── readme.md                   # App-specific documentation
 │
-├── websocket-chat/                 # WebSocket chat example
+├── ws-chat/                 # WebSocket chat example
 │   ├── index.html                  # Main HTML file
 │   └── app.js                      # WebSocket client implementation
 │
