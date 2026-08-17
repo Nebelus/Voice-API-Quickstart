@@ -2,6 +2,27 @@
 
 This guide explains how to obtain and use thread IDs in both WebSocket and Server-Sent Events (SSE) API implementations.
 
+> **Verified 2026-08-17.** Quick reference — **where the `thread_id` is returned depends on the surface**:
+>
+> | Surface | Endpoint | Read `thread_id` from |
+> |---|---|---|
+> | REST, streaming (SSE) | `POST /api/agents/{id}/chat/` with `"stream": true` | `message_start` → `data.message.thread_id` |
+> | REST, single JSON (batch) | `POST /api/agents/{id}/chat/` with `"stream": false` | top-level `thread_id` |
+> | WebSocket | `wss://.../ws/agents/{id}/chat/` | `connection` event → `data.thread_id` |
+>
+> Send it back to continue: REST → `thread_id` in the body (or `?thread_id=`); WebSocket → connect to
+> `.../ws/agents/{id}/threads/{thread_id}/`.
+>
+> **Base host:** use the API host shown in your agent's **API Integration** panel in the console
+> (`https://{your-api-host}`) — it is fixed for your organization. The examples below use
+> `api.nebelus.ai` for illustration; substitute your own host.
+>
+> **Auth:** send your API key in the **`Authorization` header** (`Authorization: Bearer sk-ns-...`; a
+> raw key without `Bearer` also works). WebSocket clients that cannot set headers (e.g. the browser
+> `WebSocket` API) may pass `?api_key=...` as a fallback — but a credential in a URL is exposed in
+> proxy logs, browser history, and referrer headers, so avoid it otherwise. The organization is
+> embedded in the key, so no tenant header is needed.
+
 ## What is a Thread ID?
 
 A thread ID is a unique identifier for a conversation between a user and an agent. When you start a new conversation, the system automatically generates a thread ID. You can use this ID to:
@@ -118,9 +139,11 @@ while (true) {
       }
     }
     
-    // Extract thread ID from message_start event
-    if (eventType === "message_start" && eventData?.thread_id) {
-      const threadId = eventData.thread_id;
+    // Extract thread ID from message_start event.
+    // NOTE: in the SSE stream the thread_id is nested under `message`,
+    // i.e. eventData.message.thread_id — NOT eventData.thread_id.
+    if (eventType === "message_start" && eventData?.message?.thread_id) {
+      const threadId = eventData.message.thread_id;
       console.log("Thread ID:", threadId);
       // Store for future use
       localStorage.setItem("nebelus_thread_id", threadId);
@@ -181,6 +204,30 @@ response = requests.post(
 )
 
 # Process the SSE response...
+```
+
+### Non-streaming (batch) responses
+
+The same REST endpoint returns a single JSON object when you send `"stream": false` (default for
+`/api/agents/{id}/chat/`) with `Accept: application/json`. Here the `thread_id` is a **top-level
+field** (not nested under `message`):
+
+```json
+{
+  "id": "…",
+  "object": "chat.completion",
+  "created": 1734567890,
+  "model": "…",
+  "thread_id": "3f0a…-…",
+  "message": { "role": "assistant", "content": "…", "finish_reason": "stop" },
+  "usage": { "…": "…" }
+}
+```
+
+```javascript
+const data = await response.json();
+const threadId = data.thread_id;            // top-level in batch mode
+const answer = data.message.content;
 ```
 
 ## Complete Examples
@@ -363,9 +410,9 @@ class SSEConversationManager {
 					}
 				}
 
-				// Extract and save thread_id
-				if (eventType === 'message_start' && eventData?.thread_id) {
-					this.threadId = eventData.thread_id;
+				// Extract and save thread_id (nested under `message` in SSE)
+				if (eventType === 'message_start' && eventData?.message?.thread_id) {
+					this.threadId = eventData.message.thread_id;
 					localStorage.setItem('sse_thread_id', this.threadId);
 					console.log('Thread ID:', this.threadId);
 				}
@@ -635,11 +682,18 @@ await resumeThreadWithFile(savedThread, file, 'Continuing with this file');
 6. **Store thread metadata** alongside thread IDs (creation date, conversation topic) for better management
 7. **Clean up expired threads** from local storage periodically
 
-## Thread Expiration
+## Thread Durability & Retention
 
-Thread IDs have an expiration period (typically 30 days). If a thread ID has expired, the system will create a new thread and return a new thread ID.
+Threads do **not** expire on a timer — there is no fixed TTL. A `thread_id` you store will normally
+continue to resume indefinitely. A thread is removed only if your organization has explicitly enabled
+a **data-retention policy** (off by default), which deletes threads older than a configured number of
+days.
 
-### Handling Expired Threads
+You should still handle the case where a stored `thread_id` no longer resolves — it may be a wrong id,
+a thread you don't own, or one removed by a retention policy. Treat "not found" as "start a new
+conversation" (fall back to a `/chat/` connection or a request with no `thread_id`).
+
+### Handling Unresolvable Threads
 
 ```javascript
 async function connectWithFallback(threadId) {
@@ -693,6 +747,19 @@ async function connectWithFallback(threadId) {
 ```
 
 ## Error Handling
+
+**WebSocket close codes.** When a resume fails, the socket closes with a specific code — branch on it:
+
+| Close code | Meaning | Recommended action |
+|---|---|---|
+| `4001` | Not authenticated | Check the API key |
+| `4002` | No organization resolved for the key | Check the API key |
+| `4003` | Thread is not yours (and not shared) | Start a new conversation |
+| `4004` | Thread not found (wrong id or wrong agent) | Start a new conversation |
+
+A thread belongs to the user who created it — you can only resume your **own** threads (or ones
+explicitly shared with you). On `4003`/`4004`, drop the stored id and open `.../chat/` for a fresh
+thread. On the REST endpoint, an unusable `thread_id` returns `400 invalid_thread_id` instead.
 
 Always handle potential errors when working with threads:
 
